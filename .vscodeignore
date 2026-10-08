@@ -3,7 +3,6 @@
 .github/**
 docs/**
 src/**
-out/test/**
 patches/**
 dist/**
 images/*.svg
@@ -12,7 +11,7 @@ images/*.svg
 .eslintrc*
 tsconfig.json
 **/*.ts
-!out/**/*.js
+out/test/**
 **/*.map
 *.vsix
 CLAUDE.local.md
