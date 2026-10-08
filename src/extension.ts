@@ -7,6 +7,7 @@ import * as vscode from 'vscode';
 import { COMMANDS, EXTENSION_NAME, STATUS_BAR_PRIORITY, CONFIG_DIR, IGNORE_FILE } from './consts';
 import { CredentialManager, ServerCredential, Identity } from './utils/credentialManager';
 import { SettingsManager, createSettingsWatcher } from './utils/settingsManager';
+import { SyncFolderManager } from './utils/syncFolderManager';
 import { BaseAPI, ProjectInfo } from './api/base';
 import { SyncEngine, SyncStatus } from './sync/syncEngine';
 import { IgnoreParser } from './sync/ignoreParser';
@@ -30,6 +31,52 @@ let collaboratorStatusItem: vscode.StatusBarItem;
 let outputChannel: vscode.OutputChannel;
 let statusUpdateInterval: NodeJS.Timeout | undefined;
 let authState: AuthState = 'none';
+let syncFolderManager: SyncFolderManager;
+let settingsWatcher: vscode.FileSystemWatcher | undefined;
+let commandTask: Promise<unknown> = Promise.resolve();
+
+function getSettingsManager(): SettingsManager | undefined {
+    const folder = syncFolderManager.getFolder();
+    return folder ? SettingsManager.getInstance(folder) : undefined;
+}
+
+function stopSync(): void {
+    stopStatusUpdates();
+    cursorTracker?.dispose();
+    cursorTracker = undefined;
+    syncEngine?.disconnect();
+    syncEngine = undefined;
+}
+
+/** Restore only the chosen folder; a missing selection must not sync the workspace instead. */
+async function activateSyncFolder(): Promise<void> {
+    stopSync();
+    settingsWatcher?.dispose();
+    settingsWatcher = undefined;
+    statusBarItem.hide();
+    loginStatusItem.hide();
+    collaboratorStatusItem.hide();
+
+    try {
+        const folder = syncFolderManager.getFolder();
+        if (!folder) return;
+        await syncFolderManager.validateFolder(folder);
+        const settings = SettingsManager.getInstance(folder);
+        await settings.load();
+        settingsWatcher = createSettingsWatcher(folder, () => {
+            void settings.load().catch(error => log(`Failed to reload settings: ${errorMessage(error)}`));
+        });
+        await updateLoginStatus();
+        if (settings.getSettings()) {
+            await initializeSync(settings);
+        }
+    } catch (error) {
+        log(`Cannot restore sync folder: ${errorMessage(error)}`);
+        vscode.window.showWarningMessage(
+            `LocalLeaf: Cannot use the sync folder (${errorMessage(error)}). Run "LocalLeaf: Select Sync Folder" to choose an existing folder.`
+        );
+    }
+}
 
 function errorMessage(error: unknown): string {
     return error instanceof Error ? error.message : String(error);
@@ -40,6 +87,7 @@ function errorMessage(error: unknown): string {
  */
 export async function activate(context: vscode.ExtensionContext) {
     try {
+    syncFolderManager = new SyncFolderManager(context.globalState);
 
     // Initialize output channel
     outputChannel = vscode.window.createOutputChannel(EXTENSION_NAME);
@@ -69,34 +117,9 @@ export async function activate(context: vscode.ExtensionContext) {
     collaboratorStatusItem.command = COMMANDS.JUMP_TO_COLLABORATOR;
     context.subscriptions.push(collaboratorStatusItem);
 
-    // Update login status
-    await updateLoginStatus();
-
-    // Register commands
+    await activateSyncFolder();
+    context.subscriptions.push({ dispose: () => settingsWatcher?.dispose() });
     registerCommands(context);
-
-    // Check if current workspace is linked
-    const settingsManager = SettingsManager.getCurrentInstance();
-    if (settingsManager && await settingsManager.isLinked()) {
-        await settingsManager.load();
-        // Show status bar only when linked
-        statusBarItem.show();
-        await initializeSync(context, settingsManager);
-    } else {
-        // Hide sync status bar when not linked
-        statusBarItem.hide();
-        collaboratorStatusItem.hide();
-    }
-
-    // Watch for settings changes
-    const workspaceFolder = vscode.workspace.workspaceFolders?.[0]?.uri;
-    if (workspaceFolder) {
-        const settingsWatcher = createSettingsWatcher(workspaceFolder, async () => {
-            log('Settings changed, reloading...');
-            await settingsManager?.load();
-        });
-        context.subscriptions.push(settingsWatcher);
-    }
 
     log('LocalLeaf activated');
 
@@ -110,29 +133,42 @@ export async function activate(context: vscode.ExtensionContext) {
  * Register all commands
  */
 function registerCommands(context: vscode.ExtensionContext) {
+    // Finish an in-flight pull or reconnect before switching its destination folder.
+    const registerCommand = (command: string, handler: () => unknown) =>
+        vscode.commands.registerCommand(command, () => {
+            const pending = commandTask.then(handler);
+            commandTask = pending.catch(error => {
+                log(`Command failed: ${errorMessage(error)}`);
+                vscode.window.showErrorMessage(`LocalLeaf: ${errorMessage(error)}`);
+            });
+            return commandTask;
+        });
     context.subscriptions.push(
-        vscode.commands.registerCommand(COMMANDS.LOGIN, cmdLogin),
-        vscode.commands.registerCommand(COMMANDS.LOGOUT, cmdLogout),
-        vscode.commands.registerCommand(COMMANDS.LINK_FOLDER, () => cmdLinkFolder(context)),
-        vscode.commands.registerCommand(COMMANDS.UNLINK_FOLDER, cmdUnlinkFolder),
-        vscode.commands.registerCommand(COMMANDS.SYNC_NOW, cmdSyncNow),
-        vscode.commands.registerCommand(COMMANDS.PULL_FROM_OVERLEAF, cmdPullFromOverleaf),
-        vscode.commands.registerCommand(COMMANDS.PUSH_TO_OVERLEAF, cmdPushToOverleaf),
-        vscode.commands.registerCommand(COMMANDS.EDIT_IGNORE_PATTERNS, cmdEditIgnorePatterns),
-        vscode.commands.registerCommand(COMMANDS.CLEAN_IGNORED_REMOTE, cmdCleanIgnoredRemoteFiles),
-        vscode.commands.registerCommand(COMMANDS.SHOW_SYNC_STATUS, cmdShowSyncStatus),
-        vscode.commands.registerCommand(COMMANDS.SET_MAIN_DOCUMENT, cmdSetMainDocument),
-        vscode.commands.registerCommand(COMMANDS.CONFIGURE, cmdConfigure),
-        vscode.commands.registerCommand(COMMANDS.JUMP_TO_COLLABORATOR, cmdJumpToCollaborator),
-        vscode.commands.registerCommand(COMMANDS.VERIFY_CREDENTIALS, cmdVerifyCredentials),
-        vscode.commands.registerCommand(COMMANDS.REFRESH_COOKIE, cmdRefreshCookie),
+        registerCommand(COMMANDS.LOGIN, cmdLogin),
+        registerCommand(COMMANDS.LOGOUT, cmdLogout),
+        registerCommand(COMMANDS.LINK_FOLDER, cmdLinkFolder),
+        registerCommand(COMMANDS.SELECT_SYNC_FOLDER, cmdSelectSyncFolder),
+        registerCommand(COMMANDS.USE_WORKSPACE_FOLDER, cmdUseWorkspaceFolder),
+        registerCommand(COMMANDS.UNLINK_FOLDER, cmdUnlinkFolder),
+        registerCommand(COMMANDS.SYNC_NOW, cmdSyncNow),
+        registerCommand(COMMANDS.PULL_FROM_OVERLEAF, cmdPullFromOverleaf),
+        registerCommand(COMMANDS.PUSH_TO_OVERLEAF, cmdPushToOverleaf),
+        registerCommand(COMMANDS.EDIT_IGNORE_PATTERNS, cmdEditIgnorePatterns),
+        registerCommand(COMMANDS.CLEAN_IGNORED_REMOTE, cmdCleanIgnoredRemoteFiles),
+        registerCommand(COMMANDS.SHOW_SYNC_STATUS, cmdShowSyncStatus),
+        registerCommand(COMMANDS.SET_MAIN_DOCUMENT, cmdSetMainDocument),
+        registerCommand(COMMANDS.CONFIGURE, cmdConfigure),
+        registerCommand(COMMANDS.JUMP_TO_COLLABORATOR, cmdJumpToCollaborator),
+        registerCommand(COMMANDS.VERIFY_CREDENTIALS, cmdVerifyCredentials),
+        registerCommand(COMMANDS.REFRESH_COOKIE, cmdRefreshCookie),
     );
 }
 
 /**
  * Initialize sync engine for linked folder
  */
-async function initializeSync(context: vscode.ExtensionContext, settings: SettingsManager): Promise<void> {
+async function initializeSync(settings: SettingsManager): Promise<void> {
+    stopSync();
     const projectSettings = settings.getSettings();
     if (!projectSettings) return;
 
@@ -170,7 +206,6 @@ async function initializeSync(context: vscode.ExtensionContext, settings: Settin
         if (socket) {
             cursorTracker = new CursorTracker(socket, settings);
             await cursorTracker.initialize();
-            context.subscriptions.push({ dispose: () => cursorTracker?.dispose() });
         }
 
         // Start periodic status updates for collaborators
@@ -248,7 +283,7 @@ async function setAuthState(state: AuthState): Promise<void> {
  */
 async function updateLoginStatus() {
     // Only show login status if folder is linked
-    const settingsManager = SettingsManager.getCurrentInstance();
+    const settingsManager = getSettingsManager();
     const isLinked = settingsManager && await settingsManager.isLinked();
 
     if (!isLinked) {
@@ -515,16 +550,7 @@ async function cmdLogout() {
     const serverUrl = credentialManager.getDefaultServer();
     await credentialManager.deleteCredential(serverUrl);
 
-    // Disconnect sync engine but keep settings
-    if (syncEngine) {
-        syncEngine.disconnect();
-        syncEngine = undefined;
-    }
-
-    if (cursorTracker) {
-        cursorTracker.dispose();
-        cursorTracker = undefined;
-    }
+    stopSync();
 
     updateStatusBar('disconnected', 'Logged out');
     await updateLoginStatus();
@@ -532,14 +558,43 @@ async function cmdLogout() {
 }
 
 /**
- * Link current folder to an Overleaf project
+ * Select a sync folder without changing the open workspace or deleting its existing link.
  */
-async function cmdLinkFolder(context: vscode.ExtensionContext) {
-    const workspaceFolder = vscode.workspace.workspaceFolders?.[0]?.uri;
+async function cmdSelectSyncFolder(): Promise<void> {
+    const selected = await vscode.window.showOpenDialog({
+        title: 'Select LocalLeaf Sync Folder',
+        openLabel: 'Select Sync Folder',
+        canSelectFiles: false,
+        canSelectFolders: true,
+        canSelectMany: false,
+    });
+    if (!selected?.[0]) return;
+
+    await syncFolderManager.selectFolder(selected[0]);
+    await activateSyncFolder();
+    const settings = getSettingsManager()?.getSettings();
+    vscode.window.showInformationMessage(
+        `LocalLeaf: Sync folder set to ${selected[0].fsPath}${settings ? '' : '. Run "LocalLeaf: Link Folder to Overleaf Project" to link it.'}`
+    );
+}
+
+/** Return to the original first-workspace-folder behavior. */
+async function cmdUseWorkspaceFolder(): Promise<void> {
+    await syncFolderManager.useWorkspaceFolder();
+    await activateSyncFolder();
+    vscode.window.showInformationMessage('LocalLeaf: Using the first workspace folder for sync.');
+}
+
+/**
+ * Link the selected sync folder to an Overleaf project
+ */
+async function cmdLinkFolder() {
+    const workspaceFolder = syncFolderManager.getFolder();
     if (!workspaceFolder) {
-        vscode.window.showErrorMessage('LocalLeaf: No workspace folder open');
+        vscode.window.showErrorMessage('LocalLeaf: No sync folder selected. Run "LocalLeaf: Select Sync Folder" first.');
         return;
     }
+    await syncFolderManager.validateFolder(workspaceFolder);
 
     // Get server URL
     const serverUrl = credentialManager.getDefaultServer();
@@ -581,6 +636,7 @@ async function cmdLinkFolder(context: vscode.ExtensionContext) {
     const project = selected.project;
 
     // Create settings
+    stopSync();
     const settingsManager = SettingsManager.getInstance(workspaceFolder);
     const settings = SettingsManager.createDefaultSettings(serverUrl, project.id, project.name);
     await settingsManager.save(settings);
@@ -598,14 +654,14 @@ async function cmdLinkFolder(context: vscode.ExtensionContext) {
     await updateLoginStatus();
 
     // Initialize sync (this will auto-pull)
-    await initializeSync(context, settingsManager);
+    await activateSyncFolder();
 }
 
 /**
  * Unlink current folder
  */
 async function cmdUnlinkFolder() {
-    const settingsManager = SettingsManager.getCurrentInstance();
+    const settingsManager = getSettingsManager();
     if (!settingsManager || !(await settingsManager.isLinked())) {
         vscode.window.showInformationMessage('LocalLeaf: This folder is not linked');
         return;
@@ -619,19 +675,11 @@ async function cmdUnlinkFolder() {
 
     if (confirm !== 'Unlink') return;
 
-    // Disconnect
-    if (syncEngine) {
-        syncEngine.disconnect();
-        syncEngine = undefined;
-    }
-
-    if (cursorTracker) {
-        cursorTracker.dispose();
-        cursorTracker = undefined;
-    }
+    stopSync();
 
     // Delete settings
     await settingsManager.delete();
+    await updateLoginStatus();
 
     updateStatusBar('disconnected');
     vscode.window.showInformationMessage('LocalLeaf: Folder unlinked');
@@ -689,9 +737,9 @@ async function cmdPushToOverleaf() {
  * Edit ignore patterns
  */
 async function cmdEditIgnorePatterns() {
-    const workspaceFolder = vscode.workspace.workspaceFolders?.[0]?.uri;
+    const workspaceFolder = syncFolderManager.getFolder();
     if (!workspaceFolder) {
-        vscode.window.showErrorMessage('LocalLeaf: No workspace folder open');
+        vscode.window.showErrorMessage('LocalLeaf: No sync folder selected. Run "LocalLeaf: Select Sync Folder" first.');
         return;
     }
 
@@ -765,13 +813,17 @@ async function cmdCleanIgnoredRemoteFiles() {
  * Show sync status
  */
 async function cmdShowSyncStatus() {
-    const settingsManager = SettingsManager.getCurrentInstance();
+    const settingsManager = getSettingsManager();
     const settings = settingsManager?.getSettings();
 
     const items: vscode.QuickPickItem[] = [];
     const currentStatus = syncEngine?.status || 'disconnected';
 
     if (settings) {
+        items.push({
+            label: '$(folder) Sync Folder',
+            description: settingsManager!.getWorkspaceFolder().fsPath,
+        });
         items.push({
             label: '$(project) Project',
             description: settings.projectName,
@@ -875,75 +927,21 @@ async function cmdShowSyncStatus() {
  * Reconnect to Overleaf (after disconnect or error)
  */
 async function cmdReconnect() {
-    const settingsManager = SettingsManager.getCurrentInstance();
+    const settingsManager = getSettingsManager();
     if (!settingsManager || !(await settingsManager.isLinked())) {
         vscode.window.showWarningMessage('LocalLeaf: No linked project');
         return;
     }
 
-    // Disconnect existing sync engine
-    if (syncEngine) {
-        syncEngine.disconnect();
-        syncEngine = undefined;
-    }
-
-    if (cursorTracker) {
-        cursorTracker.dispose();
-        cursorTracker = undefined;
-    }
-
-    stopStatusUpdates();
-
-    const projectSettings = settingsManager.getSettings();
-    if (!projectSettings) return;
-
-    const credential = await credentialManager.getCredential(projectSettings.serverUrl);
-    if (!credential) {
-        updateStatusBar('disconnected', 'Not logged in');
-        vscode.window.showWarningMessage('LocalLeaf: Please login to Overleaf first');
-        return;
-    }
-
-    const api = new BaseAPI(projectSettings.serverUrl);
-    api.setIdentity(credential.identity);
-
-    syncEngine = new SyncEngine(api, settingsManager);
-
-    syncEngine.onStatusChange(async event => {
-        updateStatusBar(event.status, event.message);
-        // Handle auth errors
-        if (event.authError) {
-            await setAuthState('expired');
-            showSessionExpiredNotification();
-        }
-    });
-
-    try {
-        updateStatusBar('syncing', 'Reconnecting...');
-        await syncEngine.connect();
-
-        const socket = syncEngine.getSocket();
-        if (socket) {
-            cursorTracker = new CursorTracker(socket, settingsManager);
-            await cursorTracker.initialize();
-        }
-
-        startStatusUpdates();
-        log('Reconnected to Overleaf');
-
-        await syncEngine.pullAll();
-        vscode.window.showInformationMessage(`LocalLeaf: Reconnected to "${projectSettings.projectName}"`);
-    } catch (error) {
-        log(`Failed to reconnect: ${error}`);
-        vscode.window.showErrorMessage(`LocalLeaf: Failed to reconnect - ${error}`);
-    }
+    await settingsManager.load();
+    await initializeSync(settingsManager);
 }
 
 /**
  * Set main document
  */
 async function cmdSetMainDocument() {
-    const settingsManager = SettingsManager.getCurrentInstance();
+    const settingsManager = getSettingsManager();
     if (!settingsManager || !(await settingsManager.isLinked())) {
         vscode.window.showErrorMessage('LocalLeaf: No linked project');
         return;
@@ -966,7 +964,7 @@ async function cmdSetMainDocument() {
  * Configure settings
  */
 async function cmdConfigure() {
-    const settingsManager = SettingsManager.getCurrentInstance();
+    const settingsManager = getSettingsManager();
     if (!settingsManager || !(await settingsManager.isLinked())) {
         vscode.window.showInformationMessage('LocalLeaf: No linked project');
         return;
@@ -993,7 +991,7 @@ async function cmdJumpToCollaborator() {
  * Verify credentials are still valid
  */
 async function cmdVerifyCredentials() {
-    const settingsManager = SettingsManager.getCurrentInstance();
+    const settingsManager = getSettingsManager();
     if (!settingsManager || !(await settingsManager.isLinked())) {
         vscode.window.showInformationMessage('LocalLeaf: No linked project');
         return;
@@ -1032,7 +1030,7 @@ async function cmdVerifyCredentials() {
  * Refresh cookie (re-login without clearing stored info)
  */
 async function cmdRefreshCookie() {
-    const settingsManager = SettingsManager.getCurrentInstance();
+    const settingsManager = getSettingsManager();
     if (!settingsManager || !(await settingsManager.isLinked())) {
         vscode.window.showWarningMessage('LocalLeaf: No linked project');
         return;
@@ -1105,12 +1103,7 @@ async function cmdRefreshCookie() {
  * Extension deactivation
  */
 export function deactivate() {
-    stopStatusUpdates();
-
-    if (syncEngine) {
-        syncEngine.disconnect();
-    }
-    if (cursorTracker) {
-        cursorTracker.dispose();
-    }
+    settingsWatcher?.dispose();
+    settingsWatcher = undefined;
+    stopSync();
 }

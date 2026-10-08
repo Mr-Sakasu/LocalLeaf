@@ -23,8 +23,16 @@
     "tex"
   ],
   "activationEvents": [
-    "workspaceContains:.localleaf"
+    "workspaceContains:.localleaf",
+    "onStartupFinished"
   ],
+  "extensionKind": ["workspace"],
+  "capabilities": {
+    "untrustedWorkspaces": {
+      "supported": false,
+      "description": "LocalLeaf synchronizes local files with Overleaf and requires a trusted window."
+    }
+  },
   "main": "./out/extension.js",
   "contributes": {
     "commands": [
@@ -39,6 +47,14 @@
       {
         "command": "localleaf.linkFolder",
         "title": "LocalLeaf: Link Folder to Overleaf Project"
+      },
+      {
+        "command": "localleaf.selectSyncFolder",
+        "title": "LocalLeaf: Select Sync Folder"
+      },
+      {
+        "command": "localleaf.useWorkspaceFolder",
+        "title": "LocalLeaf: Use Workspace Folder for Sync"
       },
       {
         "command": "localleaf.unlinkFolder",

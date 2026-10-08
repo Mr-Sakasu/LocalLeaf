@@ -353,6 +353,9 @@ async function run(): Promise<void> {
     assert.deepStrictEqual(deleted, ['/thesis.aux']);
     assert.equal(cleanup.fileTreeByPath.has('/thesis.tex'), true);
 
+    const { testSyncFolders } = require('./syncFolderTest') as typeof import('./syncFolderTest');
+    await testSyncFolders();
+
     Module._load = originalLoad;
     console.log('LocalLeaf synchronization regression tests passed.');
 }

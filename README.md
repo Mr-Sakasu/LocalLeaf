@@ -29,6 +29,29 @@ A VS Code extension for a workaround solution to collaborate on LaTeX documents 
 3. Open a folder and run `LocalLeaf: Link Folder to Overleaf Project`
 4. Start editing - changes sync automatically!
 
+### Choose a sync folder independently of the workspace
+
+Run `LocalLeaf: Select Sync Folder` and select an existing folder. If it already
+contains `.localleaf/settings.json`, LocalLeaf reconnects to that project. Otherwise,
+run `LocalLeaf: Link Folder to Overleaf Project` to link the selected folder.
+
+The selection is saved locally for this extension host and restored when VS Code
+starts, including when a different workspace or an empty window is open. Sync,
+reconnect, ignore patterns, and project settings all use the selected folder. Only
+one folder is active per window; switching folders disconnects the previous project
+and leaves its link settings intact. `LocalLeaf: Show Sync Status` displays the
+active folder. A missing saved folder stops synchronization until you choose an
+existing folder or return to workspace-based sync.
+
+Use `LocalLeaf: Use Workspace Folder for Sync` to clear the selection and return to
+syncing the first workspace folder. Without an explicit selection, the original
+workspace-based behavior remains the default. Unlinking removes the project link
+from the active folder, but keeps the folder selection.
+
+In Remote SSH, WSL, and Dev Containers, LocalLeaf runs on the remote extension host.
+Select a folder on that host's filesystem. The saved selection is not synced to
+other machines. VS Code must remain running in a trusted window for synchronization.
+
 > [!WARNING]
 > - Only paste cookies when the server URL is the real Overleaf host (`https://www.overleaf.com`). The extension sends the cookie to whatever URL you enter; avoid lookalike URLs such as `https://www.overleaf.com.attacker.test` or ones that hide another host (e.g., `https://www.overleaf.com@evil.com`).
 > - Cookies are stored in VS Code Secret Storage, not in your workspace, but they still grant full account access. Treat them like a password and clear credentials with `LocalLeaf: Logout` if you suspect exposure.
@@ -42,6 +65,8 @@ A VS Code extension for a workaround solution to collaborate on LaTeX documents 
 | `LocalLeaf: Verify Credentials` | Check if your session is still valid |
 | `LocalLeaf: Refresh Cookie` | Re-authenticate without full re-login |
 | `LocalLeaf: Link Folder to Overleaf Project` | Connect a local folder to an Overleaf project |
+| `LocalLeaf: Select Sync Folder` | Select and remember a sync folder independently of the workspace |
+| `LocalLeaf: Use Workspace Folder for Sync` | Clear the selection and sync the first workspace folder |
 | `LocalLeaf: Unlink Folder` | Disconnect folder from Overleaf project |
 | `LocalLeaf: Sync Now` | Manually trigger two-way sync |
 | `LocalLeaf: Pull from Overleaf` | Download changes from Overleaf |
