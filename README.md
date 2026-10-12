@@ -43,15 +43,23 @@ A VS Code extension for a workaround solution to collaborate on LaTeX documents 
 | `LocalLeaf: Refresh Cookie` | Re-authenticate without full re-login |
 | `LocalLeaf: Link Folder to Overleaf Project` | Connect a local folder to an Overleaf project |
 | `LocalLeaf: Unlink Folder` | Disconnect folder from Overleaf project |
-| `LocalLeaf: Sync Now` | Manually trigger two-way sync |
+| `LocalLeaf: Sync Now` | Pull remote changes and resolve differences |
 | `LocalLeaf: Pull from Overleaf` | Download changes from Overleaf |
-| `LocalLeaf: Push to Overleaf` | Upload local changes to Overleaf |
+| `LocalLeaf: Push to Overleaf` | Review and upload selected saved local changes |
 | `LocalLeaf: Show Sync Status` | Display sync status and options to resync/reconnect |
 | `LocalLeaf: Edit Ignore Patterns` | Configure files to exclude from sync |
 | `LocalLeaf: Clean Ignored Files from Overleaf` | Delete stale remote files matched by `.leafignore`, after confirmation |
 | `LocalLeaf: Set Main Document` | Set the main `.tex` file for compilation |
 | `LocalLeaf: Configure Settings` | Open extension settings |
 | `LocalLeaf: Jump to Collaborator` | Navigate to a collaborator's cursor position |
+
+### Uploading manually
+
+Save your files, connect to Overleaf, and run **LocalLeaf: Push to Overleaf** from the Command Palette (or choose **Push local changes to Overleaf** in the sync status menu). Select the changed files to upload and press Enter. Existing selected files are updated with local contents; new files are created. Files excluded by `.leafignore` are skipped, and remote-only files are not deleted.
+
+If a file changes while the selection is open, review it and run the command again. The result reports uploaded and failed files; failures remain eligible for retry.
+
+To control when uploads happen, disable **Localleaf: Auto Sync** in VS Code settings (`localleaf.autoSync: false`). A project's `.localleaf/settings.json` setting `autoSync: false` also disables automatic uploads. Manual push remains available with either setting disabled.
 
 ## Settings
 
