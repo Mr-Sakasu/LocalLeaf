@@ -25,6 +25,7 @@ let credentialManager: CredentialManager;
 let syncEngine: SyncEngine | undefined;
 let cursorTracker: CursorTracker | undefined;
 let statusBarItem: vscode.StatusBarItem;
+let pushStatusBarItem: vscode.StatusBarItem;
 let loginStatusItem: vscode.StatusBarItem;
 let collaboratorStatusItem: vscode.StatusBarItem;
 let outputChannel: vscode.OutputChannel;
@@ -73,6 +74,7 @@ function queueCommand(handler: () => unknown): Promise<unknown> {
 
 function stopSync(resetAttempts = true): void {
     cancelReconnect(resetAttempts);
+    pushStatusBarItem?.hide();
     stopStatusUpdates();
     cursorTracker?.dispose();
     cursorTracker = undefined;
@@ -106,6 +108,13 @@ export async function activate(context: vscode.ExtensionContext) {
     statusBarItem = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Left, STATUS_BAR_PRIORITY);
     statusBarItem.name = `${EXTENSION_NAME} Sync`;
     context.subscriptions.push(statusBarItem);
+
+    pushStatusBarItem = vscode.window.createStatusBarItem('localleaf.pushToOverleaf', vscode.StatusBarAlignment.Left, STATUS_BAR_PRIORITY - 0.5);
+    pushStatusBarItem.name = `${EXTENSION_NAME} Push to Overleaf`;
+    pushStatusBarItem.text = '$(cloud-upload) Push to Overleaf';
+    pushStatusBarItem.tooltip = 'Choose saved local changes to upload to Overleaf';
+    pushStatusBarItem.command = COMMANDS.PUSH_TO_OVERLEAF;
+    context.subscriptions.push(pushStatusBarItem);
 
     // Login status (left side, before sync)
     loginStatusItem = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Left, STATUS_BAR_PRIORITY + 1);
@@ -304,6 +313,15 @@ function updateStatusBar(status: SyncStatus, message?: string) {
     }
 
     statusBarItem.show();
+    if (syncEngine) {
+        pushStatusBarItem.text = `${status === 'pushing' ? '$(sync~spin)' : '$(cloud-upload)'} Push to Overleaf`;
+        pushStatusBarItem.tooltip = syncEngine.getSocket()?.isConnected
+            ? 'Choose saved local changes to upload to Overleaf'
+            : 'Reconnect to Overleaf before uploading';
+        pushStatusBarItem.show();
+    } else {
+        pushStatusBarItem.hide();
+    }
 
     // Update collaborator status bar based on connection
     if (status === 'disconnected' || status === 'error') {

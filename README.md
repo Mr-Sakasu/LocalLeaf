@@ -55,7 +55,7 @@ A VS Code extension for a workaround solution to collaborate on LaTeX documents 
 
 ### Uploading manually
 
-Save your files, connect to Overleaf, and run **LocalLeaf: Push to Overleaf** from the Command Palette (or choose **Push local changes to Overleaf** in the sync status menu). Select the changed files to upload and press Enter. Existing selected files are updated with local contents; new files are created. Files excluded by `.leafignore` are skipped, and remote-only files are not deleted.
+Save your files, connect to Overleaf, and run **LocalLeaf: Push to Overleaf** from the Command Palette, click **Push to Overleaf** in the status bar, or choose **Push local changes to Overleaf** in the sync status menu. Select the changed files to upload and press Enter. Existing selected files are updated with local contents; new files are created. Files excluded by `.leafignore` are skipped, and remote-only files are not deleted.
 
 If a file changes while the selection is open, review it and run the command again. The result reports uploaded and failed files; failures remain eligible for retry.
 

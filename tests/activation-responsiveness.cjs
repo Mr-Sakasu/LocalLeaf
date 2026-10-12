@@ -22,6 +22,7 @@ async function waitFor(predicate) {
     const pull = deferred();
     const handlers = new Map();
     const menus = [];
+    const statusItems = [];
     const messages = [];
     const errors = [];
     const opened = [];
@@ -47,7 +48,11 @@ async function waitFor(predicate) {
         window: {
             withProgress: async (_options, task) => task(),
             createOutputChannel: () => output,
-            createStatusBarItem: () => ({show() {}, hide() {}, dispose() {}}),
+            createStatusBarItem: () => {
+                const item = {visible: false, show() {this.visible = true;}, hide() {this.visible = false;}, dispose() {}};
+                statusItems.push(item);
+                return item;
+            },
             showQuickPick: async items => {
                 menus.push(items);
                 const selected = selection;
@@ -72,8 +77,8 @@ async function waitFor(predicate) {
     };
     class SyncEngine {
         constructor() { this.status = 'syncing'; this.disconnected = false; engines.push(this); }
-        onStatusChange() {}
-        async connect() { await connection.promise; this.status = 'idle'; }
+        onStatusChange(callback) {this.statusChanged = callback;}
+        async connect() { await connection.promise; this.status = 'idle'; this.statusChanged({status: 'idle'}); }
         getSocket() { return {isConnected: true}; }
         startLocalWatcher() {}
         async detectMainDocument() {}
@@ -139,7 +144,11 @@ async function waitFor(predicate) {
         assert.equal(opened.length, 1);
         assert.equal(engines.length, 2);
         assert.equal(engines[0].disconnected, true);
-        await handlers.get('localleaf.pushToOverleaf')();
+        const pushButton = statusItems.find(item => item.name === 'LocalLeaf Push to Overleaf');
+        assert.ok(pushButton.visible);
+        assert.equal(pushButton.text, '$(cloud-upload) Push to Overleaf');
+        assert.equal(pushButton.command, 'localleaf.pushToOverleaf');
+        await handlers.get(pushButton.command)();
         assert.equal(pushes, 1);
         selection = {label: '$(cloud-upload) Push local changes to Overleaf'};
         await handlers.get('localleaf.showSyncStatus')();
@@ -151,5 +160,6 @@ async function waitFor(predicate) {
         connection.resolve();
         pull.resolve();
         exports.deactivate();
+        assert.equal(statusItems.find(item => item.name === 'LocalLeaf Push to Overleaf').visible, false);
     }
 })().catch(error => { console.error(error); process.exitCode = 1; });
