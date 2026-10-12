@@ -124,6 +124,8 @@ export class SyncEngine {
     private socket?: SocketIOAPI;
     private disposed = false;
     private authExpired = false;
+    private manualPushInProgress = false;
+    private deferredLocalChanges = new Map<string, () => Promise<void>>();
     private project?: ProjectEntity;
     private localWatcher?: vscode.FileSystemWatcher;
     private fileTree: Map<string, FileTreeEntry> = new Map();
@@ -503,11 +505,22 @@ export class SyncEngine {
 
     // === Local change handlers ===
 
+    private deferAutomaticChange(uri: vscode.Uri, handler: () => Promise<void>): boolean {
+        if (this.settings.getSettings()?.autoSync === false ||
+            !vscode.workspace.getConfiguration('localleaf', this.settings.getWorkspaceFolder()).get('autoSync', true)) {
+            return true;
+        }
+        if (!this.manualPushInProgress) return false;
+        this.deferredLocalChanges.set(uri.path, handler);
+        return true;
+    }
+
     /**
      * Handle local file change
      */
     private async handleLocalFileChange(uri: vscode.Uri): Promise<void> {
         if (this.disposed || this.authExpired || !this.socket?.isConnected) return;
+        if (this.deferAutomaticChange(uri, () => this.handleLocalFileChange(uri))) return;
         const relativePath = this.getRelativePath(uri);
         if (!this.shouldSync(relativePath)) return;
         if (!this.acquireLock(relativePath)) {
@@ -577,13 +590,16 @@ export class SyncEngine {
      * Push document changes using OT
      * Returns true if changes were actually pushed
      */
-    private async pushDocumentChanges(docId: string, path: string, newContent: Uint8Array): Promise<boolean> {
+    private async pushDocumentChanges(docId: string, path: string, newContent: Uint8Array, expectedRemote?: Uint8Array): Promise<boolean> {
         if (!this.socket) return false;
 
         try {
             // Join document to get current version (even if already joined for watching)
             const { lines: remoteLines, version } = await this.socket.joinDoc(docId);
             const remoteContent = remoteLines.join('\n');
+            if (expectedRemote && !contentEquals(new TextEncoder().encode(remoteContent), expectedRemote)) {
+                throw new Error('Overleaf contents changed; review and push again');
+            }
             const localContent = new TextDecoder().decode(newContent);
 
             // Calculate diff and create OT operations
@@ -835,6 +851,7 @@ export class SyncEngine {
      */
     private async handleLocalFileCreate(uri: vscode.Uri): Promise<void> {
         if (this.disposed || this.authExpired || !this.socket?.isConnected) return;
+        if (this.deferAutomaticChange(uri, () => this.handleLocalFileCreate(uri))) return;
         const relativePath = this.getRelativePath(uri);
         if (!this.shouldSync(relativePath)) return;
         if (!this.acquireLock(relativePath)) {
@@ -962,6 +979,7 @@ export class SyncEngine {
      */
     private async handleLocalFileDelete(uri: vscode.Uri): Promise<void> {
         if (this.disposed || this.authExpired || !this.socket?.isConnected) return;
+        if (this.deferAutomaticChange(uri, () => this.handleLocalFileDelete(uri))) return;
         const relativePath = this.getRelativePath(uri);
         if (!this.shouldSync(relativePath)) return;
         if (!this.acquireLock(relativePath)) {
@@ -1374,6 +1392,141 @@ export class SyncEngine {
 
     // === Public methods ===
 
+    /** Upload user-selected saved files without downloading or deleting local files. */
+    async pushAll(): Promise<{ uploaded: number; failed: string[]; cancelled: boolean }> {
+        const requireConnection = () => {
+            if (this.disposed || this.authExpired || !this.socket?.isConnected) {
+                throw new Error('Not connected to Overleaf. Reconnect before pushing.');
+            }
+        };
+        requireConnection();
+        if (this.manualPushInProgress) throw new Error('A push is already in progress');
+        this.manualPushInProgress = true;
+        const previousStatus = this.status;
+        const result = { uploaded: 0, failed: [] as string[], cancelled: false };
+        try {
+            await this.ignoreParser.load();
+            const folder = this.settings.getWorkspaceFolder();
+            const prefix = folder.path.replace(/\/$/, '') + '/';
+            const dirty = vscode.workspace.textDocuments.find(doc =>
+                doc.isDirty && doc.uri.scheme === folder.scheme && doc.uri.path.startsWith(prefix) &&
+                this.shouldSync(this.getRelativePath(doc.uri)));
+            if (dirty) throw new Error(`Save ${this.getRelativePath(dirty.uri)} before pushing to Overleaf.`);
+            this.setStatus('pushing', 'Checking local changes...');
+            await this.refreshProjectFileTree();
+            const projectId = this.settings.getSettings()!.projectId;
+            const readRemote = async (entry: FileTreeEntry): Promise<Uint8Array> => {
+                requireConnection();
+                if (entry.type === 'doc') {
+                    const { lines } = await this.socket!.joinDoc(entry.id);
+                    this.joinedDocs.add(entry.id);
+                    return new TextEncoder().encode(lines.join('\n'));
+                }
+                if (entry.type !== 'file') throw new Error(`${entry.path} is a folder on Overleaf`);
+                const response = await this.api.getFile(projectId, entry.id);
+                ensureApiSuccess(response, `Read ${entry.path}`);
+                if (!response.content) throw new Error(`No content returned for ${entry.path}`);
+                return response.content;
+            };
+            const candidates: Array<vscode.QuickPickItem & {
+                path: string; content: Uint8Array; remote?: Uint8Array; remoteId?: string;
+            }> = [];
+            const scan = async (directory: vscode.Uri, parent = '/'): Promise<void> => {
+                for (const [name, type] of await vscode.workspace.fs.readDirectory(directory)) {
+                    const path = parent + name + (type === vscode.FileType.Directory ? '/' : '');
+                    if (!this.shouldSync(path) || (type & vscode.FileType.SymbolicLink)) continue;
+                    const uri = vscode.Uri.joinPath(directory, name);
+                    if (type === vscode.FileType.Directory) {
+                        await scan(uri, path);
+                    } else if (type === vscode.FileType.File) {
+                        if (this.syncLock.has(path)) throw new Error(`Wait for the current sync of ${path}, then push again.`);
+                        const content = await vscode.workspace.fs.readFile(uri);
+                        const entry = this.fileTreeByPath.get(path);
+                        const remote = entry ? await readRemote(entry) : undefined;
+                        if (contentEquals(content, remote)) continue;
+                        candidates.push({ label: path, path, content, remote, remoteId: entry?.id,
+                            description: entry ? 'Update on Overleaf' : 'New file', picked: true });
+                    }
+                }
+            };
+            await scan(folder);
+            if (candidates.length === 0) {
+                this.setStatus('idle', 'Saved files already match Overleaf');
+                return result;
+            }
+            const selected = await vscode.window.showQuickPick(candidates.sort((a, b) => a.path.localeCompare(b.path)), {
+                canPickMany: true,
+                title: 'Push local changes to Overleaf',
+                placeHolder: 'Choose saved files to upload. Selected remote files will be replaced with local contents.',
+                ignoreFocusOut: true,
+            });
+            if (!selected?.length) {
+                result.cancelled = true;
+                this.setStatus(previousStatus, 'Push cancelled');
+                return result;
+            }
+            await this.ignoreParser.load();
+            await this.refreshProjectFileTree();
+            for (const candidate of selected) {
+                const path = candidate.path;
+                if (!this.acquireLock(path)) {
+                    result.failed.push(`${path}: another sync is in progress`);
+                    continue;
+                }
+                const previousBase = this.baseContent.get(path);
+                const previousCache = this.fileCache.get(path);
+                try {
+                    requireConnection();
+                    if (!this.shouldSync(path)) throw new Error('file is now ignored');
+                    const current = await vscode.workspace.fs.readFile(this.settings.getFilePath(path));
+                    if (!contentEquals(current, candidate.content)) throw new Error('local contents changed; review and push again');
+                    const entry = this.fileTreeByPath.get(path);
+                    const remote = entry ? await readRemote(entry) : undefined;
+                    if (entry?.id !== candidate.remoteId || !contentEquals(remote, candidate.remote)) {
+                        throw new Error('Overleaf contents changed; review and push again');
+                    }
+                    this.setStatus('pushing', `Uploading ${path}`, path);
+                    if (!entry) await this.uploadLocalFile(path, current);
+                    else if (entry.type === 'doc') await this.pushDocumentChanges(entry.id, path, current, remote);
+                    else await this.replaceRemoteFile(entry, current);
+                    this.baseContent.set(path, current);
+                    this.fileCache.set(path, { hash: hashContent(current), timestamp: Date.now() });
+                    this.log(`Manually pushed to Overleaf: ${path}`);
+                    result.uploaded++;
+                } catch (error) {
+                    if (previousBase) this.baseContent.set(path, previousBase);
+                    else this.baseContent.delete(path);
+                    if (previousCache) this.fileCache.set(path, previousCache);
+                    else this.fileCache.delete(path);
+                    const message = error instanceof Error ? error.message : String(error);
+                    result.failed.push(`${path}: ${message}`);
+                    this.log(`Manual push failed: ${path}: ${message}`);
+                    if (isAuthError(error)) {
+                        this.authExpired = true;
+                        this.setStatus('error', 'Session expired', undefined, true);
+                        break;
+                    }
+                } finally {
+                    this.releaseLock(path);
+                }
+            }
+            if (result.uploaded > 0 && result.failed.length === 0) await this.settings.updateLastSynced();
+            if (!this.authExpired) this.setStatus(result.failed.length ? 'error' : 'idle',
+                `Push complete: ${result.uploaded} uploaded, ${result.failed.length} failed`);
+            return result;
+        } catch (error) {
+            const authErr = isAuthError(error);
+            if (authErr) this.authExpired = true;
+            this.setStatus('error', `Push failed: ${error}`, undefined, authErr);
+            throw error;
+        } finally {
+            this.manualPushInProgress = false;
+            const deferred = [...this.deferredLocalChanges.values()];
+            this.deferredLocalChanges.clear();
+            for (const handler of deferred) void handler();
+        }
+    }
+
     /**
      * Conflict resolution options
      */
@@ -1692,10 +1845,10 @@ export class SyncEngine {
     /**
      * Upload a local file to Overleaf (create new entity).
      */
-    private async uploadLocalFile(relativePath: string): Promise<void> {
+    private async uploadLocalFile(relativePath: string, snapshot?: Uint8Array): Promise<void> {
         const projectSettings = this.settings.getSettings()!;
         const localUri = this.settings.getFilePath(relativePath);
-        const content = await vscode.workspace.fs.readFile(localUri);
+        const content = snapshot ?? await vscode.workspace.fs.readFile(localUri);
 
         // Ensure all parent folders exist (creates them if needed)
         const parentId = await this.ensureParentFoldersExist(relativePath);

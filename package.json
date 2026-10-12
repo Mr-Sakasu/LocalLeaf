@@ -106,7 +106,7 @@
     }
   },
   "scripts": {
-    "test:reliability": "npm run compile && node out/test/runTest.js && node tests/activation-responsiveness.cjs && node tests/connection-reliability.cjs && node tests/http-timeouts.cjs",
+    "test:reliability": "npm run compile && node out/test/runTest.js && node tests/activation-responsiveness.cjs && node tests/connection-reliability.cjs && node tests/manual-push.cjs && node tests/http-timeouts.cjs",
     "vscode:prepublish": "npm run compile",
     "compile": "tsc -p ./",
     "watch": "tsc -watch -p ./",

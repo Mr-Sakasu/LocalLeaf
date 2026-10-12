@@ -27,6 +27,7 @@ async function waitFor(predicate) {
     const opened = [];
     const engines = [];
     let outputShown = 0;
+    let pushes = 0;
     let selection;
     let pullStarted = false;
     const folder = { fsPath: '/test/thesis/tex', path: '/test/thesis/tex' };
@@ -42,7 +43,9 @@ async function waitFor(predicate) {
     };
     const output = { appendLine() {}, show() { outputShown++; }, dispose() {} };
     const vscode = {
+        ProgressLocation: {Notification: 1},
         window: {
+            withProgress: async (_options, task) => task(),
             createOutputChannel: () => output,
             createStatusBarItem: () => ({show() {}, hide() {}, dispose() {}}),
             showQuickPick: async items => {
@@ -76,6 +79,7 @@ async function waitFor(predicate) {
         async detectMainDocument() {}
         async pullAll() { pullStarted = true; this.status = 'pulling'; await pull.promise; this.status = 'idle'; }
         async joinAllDocsForWatching() {}
+        async pushAll() {pushes++; return {uploaded: 2, failed: [], cancelled: false};}
         disconnect() { this.disconnected = true; }
     }
     const mocks = {
@@ -135,6 +139,12 @@ async function waitFor(predicate) {
         assert.equal(opened.length, 1);
         assert.equal(engines.length, 2);
         assert.equal(engines[0].disconnected, true);
+        await handlers.get('localleaf.pushToOverleaf')();
+        assert.equal(pushes, 1);
+        selection = {label: '$(cloud-upload) Push local changes to Overleaf'};
+        await handlers.get('localleaf.showSyncStatus')();
+        assert.equal(pushes, 2, 'status menu performs the same manual push');
+        assert.ok(messages.some(message => message.includes('Pushed 2 file(s)')));
         assert.equal(errors.length, 0, errors.join('\n'));
         console.log('PASS: activation and status are responsive during blocked connection and pull; sync actions remain serialized.');
     } finally {

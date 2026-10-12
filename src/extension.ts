@@ -742,7 +742,28 @@ async function cmdPushToOverleaf() {
         return;
     }
 
-    vscode.window.showInformationMessage('LocalLeaf: Push is automatic via real-time sync');
+    const engine = syncEngine;
+    if (!engine.getSocket()?.isConnected) {
+        vscode.window.showWarningMessage('LocalLeaf: Reconnect to Overleaf before pushing. Use LocalLeaf: Show Sync Status.');
+        return;
+    }
+    try {
+        const result = await vscode.window.withProgress({
+            location: vscode.ProgressLocation.Notification,
+            title: 'LocalLeaf: Preparing and uploading local changes...',
+            cancellable: false,
+        }, () => engine.pushAll());
+        if (result.cancelled) return;
+        if (result.failed.length) {
+            vscode.window.showErrorMessage(`LocalLeaf: ${result.uploaded} uploaded, ${result.failed.length} failed. ${result.failed[0]}`);
+        } else {
+            vscode.window.showInformationMessage(result.uploaded
+                ? `LocalLeaf: Pushed ${result.uploaded} file(s) to Overleaf.`
+                : 'LocalLeaf: Saved files already match Overleaf.');
+        }
+    } catch (error) {
+        vscode.window.showErrorMessage(`LocalLeaf: Push failed - ${errorMessage(error)}`);
+    }
 }
 
 /**
@@ -877,6 +898,10 @@ async function cmdShowSyncStatus() {
     items.push({ label: '', kind: vscode.QuickPickItemKind.Separator });
     items.push({ label: '$(output) Show LocalLeaf Output', description: 'View connection and sync logs' });
 
+    if (settings && syncEngine?.getSocket()?.isConnected) {
+        items.push({label: '$(cloud-upload) Push local changes to Overleaf', description: 'Choose files to upload'});
+    }
+
     // Show resync option when there's an error or when connected
     if (settings && (currentStatus === 'error' || currentStatus === 'idle')) {
         items.push({
@@ -938,6 +963,8 @@ async function cmdShowSyncStatus() {
 
     if (selected?.label.includes('Show LocalLeaf Output')) {
         outputChannel.show();
+    } else if (selected?.label.includes('Push local changes')) {
+        await scheduleAction(cmdPushToOverleaf);
     } else if (selected?.label.includes('Resync')) {
         await scheduleAction(cmdPullFromOverleaf);
     } else if (selected?.label.includes('Reconnect')) {

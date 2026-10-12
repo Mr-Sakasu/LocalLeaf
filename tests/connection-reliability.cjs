@@ -47,7 +47,7 @@ async function syncTests() {
         vscode: {
             EventEmitter: class {event = () => {}; fire(event) {statuses.push(event);}},
             FileSystemError: class extends Error {},
-            workspace: {fs: {
+            workspace: {getConfiguration: () => ({get: () => true}), fs: {
                 readFile: async () => content,
                 writeFile: async () => {writes++;},
                 stat: async () => ({}),

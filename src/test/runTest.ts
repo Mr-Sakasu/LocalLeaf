@@ -33,7 +33,7 @@ Module._load = function (request: string, parent: unknown, isMain: boolean): unk
             EventEmitter: MockEventEmitter,
             FileSystemError: MockFileSystemError,
             FileType: { File: 1, Directory: 2 },
-            workspace: { fs: {} },
+            workspace: { fs: {}, getConfiguration: () => ({ get: () => true }) },
         };
     }
     if (request === '../api/socketio') {
@@ -289,6 +289,7 @@ async function run(): Promise<void> {
 
     const localCreate = Object.create(SyncEngine.prototype) as any;
     localCreate.socket = { isConnected: true };
+    localCreate.settings = { getSettings: () => ({}), getWorkspaceFolder: () => ({}) };
     localCreate.getRelativePath = () => '/new.tex';
     localCreate.shouldSync = () => true;
     localCreate.acquireLock = () => false;
