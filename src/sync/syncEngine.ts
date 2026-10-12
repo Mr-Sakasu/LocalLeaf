@@ -122,6 +122,8 @@ interface FileTreeEntry {
  */
 export class SyncEngine {
     private socket?: SocketIOAPI;
+    private disposed = false;
+    private authExpired = false;
     private project?: ProjectEntity;
     private localWatcher?: vscode.FileSystemWatcher;
     private fileTree: Map<string, FileTreeEntry> = new Map();
@@ -196,9 +198,13 @@ export class SyncEngine {
 
             // Register socket event handlers
             this.socket.registerHandlers({
-                onConnected: () => this.setStatus('idle', 'Connected (real-time)'),
+                onConnected: () => {
+                    if (!this.disposed && !this.authExpired) this.setStatus('idle', 'Connected (real-time)');
+                },
                 onDisconnected: (isAuthError?: boolean) => {
+                    if (this.disposed || this.authExpired) return;
                     if (isAuthError) {
+                        this.authExpired = true;
                         this.setStatus('error', 'Session expired', undefined, true);
                     } else {
                         this.setStatus('disconnected', 'Disconnected');
@@ -216,7 +222,10 @@ export class SyncEngine {
             this.buildFileTree(this.project);
             this.setStatus('idle', 'Connected (real-time)');
         } catch (error) {
-            debugLog('Socket.io failed, using HTTP fallback:', error);
+            this.log(`Real-time connection failed: ${error}`);
+            this.socket?.disconnect();
+            this.socket = undefined;
+            if (this.authExpired) throw new Error('Session expired');
             useHttpFallback = true;
         }
 
@@ -265,7 +274,7 @@ export class SyncEngine {
                     }
                 }
 
-                this.setStatus('idle', 'Connected (HTTP mode)');
+                this.setStatus('disconnected', 'HTTP available; real-time connection unavailable');
             } catch (httpError) {
                 const authErr = isAuthError(httpError);
                 this.setStatus('error', authErr ? 'Session expired' : `Failed to connect: ${httpError}`, undefined, authErr);
@@ -273,8 +282,7 @@ export class SyncEngine {
             }
         }
 
-        // Setup local file watcher
-        this.setupLocalWatcher();
+        // Start the watcher only after the initial pull has resolved local conflicts.
     }
 
     /**
@@ -412,7 +420,8 @@ export class SyncEngine {
     /**
      * Setup local file system watcher
      */
-    private setupLocalWatcher(): void {
+    startLocalWatcher(): void {
+        if (this.disposed || this.localWatcher || !this.socket?.isConnected) return;
         const workspaceFolder = this.settings.getWorkspaceFolder();
         const pattern = new vscode.RelativePattern(workspaceFolder, '**/*');
 
@@ -454,7 +463,6 @@ export class SyncEngine {
             return false;
         }
 
-        this.fileCache.set(path, { hash: newHash, timestamp: Date.now() });
         return true;
     }
 
@@ -499,6 +507,7 @@ export class SyncEngine {
      * Handle local file change
      */
     private async handleLocalFileChange(uri: vscode.Uri): Promise<void> {
+        if (this.disposed || this.authExpired || !this.socket?.isConnected) return;
         const relativePath = this.getRelativePath(uri);
         if (!this.shouldSync(relativePath)) return;
         if (!this.acquireLock(relativePath)) {
@@ -546,6 +555,7 @@ export class SyncEngine {
             }
 
             this.baseContent.set(relativePath, content);
+            this.fileCache.set(relativePath, { hash: hashContent(content), timestamp: Date.now() });
             this.setStatus('idle');
         } catch (error) {
             // Don't show error for file-not-found during rapid operations
@@ -554,6 +564,7 @@ export class SyncEngine {
                 this.setStatus('idle');
                 return;
             }
+            this.log(`Failed to sync ${relativePath}: ${error}`);
             console.error(`[LocalLeaf] Failed to sync ${relativePath}:`, error);
             const authErr = isAuthError(error);
             this.setStatus('error', authErr ? 'Session expired' : `Failed to sync: ${error}`, undefined, authErr);
@@ -823,6 +834,7 @@ export class SyncEngine {
      * Handle local file creation
      */
     private async handleLocalFileCreate(uri: vscode.Uri): Promise<void> {
+        if (this.disposed || this.authExpired || !this.socket?.isConnected) return;
         const relativePath = this.getRelativePath(uri);
         if (!this.shouldSync(relativePath)) return;
         if (!this.acquireLock(relativePath)) {
@@ -949,6 +961,7 @@ export class SyncEngine {
      * Handle local file deletion
      */
     private async handleLocalFileDelete(uri: vscode.Uri): Promise<void> {
+        if (this.disposed || this.authExpired || !this.socket?.isConnected) return;
         const relativePath = this.getRelativePath(uri);
         if (!this.shouldSync(relativePath)) return;
         if (!this.acquireLock(relativePath)) {
@@ -1277,6 +1290,14 @@ export class SyncEngine {
                 localBytes = undefined;
             }
 
+            // OT positions refer to the last synchronized content, not to edits
+            // made locally while offline or left unresolved after a reconnect.
+            if (!contentEquals(localBytes, this.baseContent.get(entry.path))) {
+                this.log(`Remote update deferred: unresolved local edits in ${entry.path}`);
+                this.setStatus('error', `Local edits in ${entry.path}; pull to resolve the conflict`);
+                return;
+            }
+
             // Apply OT operations
             let newContent = localContent;
             if (update.op) {
@@ -1325,8 +1346,8 @@ export class SyncEngine {
                     await this.socket.joinDoc(id);
                     this.joinedDocs.add(id);
                     joinedCount++;
-                } catch {
-                    // Ignore join errors for individual docs
+                } catch (error) {
+                    throw new Error(`Failed to watch ${entry.path}: ${error}`);
                 }
             }
         }
@@ -1819,15 +1840,13 @@ export class SyncEngine {
                                 'lines:', lines.length,
                                 'contentLen:', content.length);
                         } catch (err) {
-                            debugLog('pullAll: Failed to joinDoc', entry.path, err);
-                            return;
+                            throw new Error(`Failed to download ${entry.path}: ${err}`);
                         }
                     } else {
                         // HTTP fallback for docs
                         const result = await this.api.getDocContent(projectSettings.projectId, entry.id);
                         if (result.type !== 'success' || !result.lines) {
-                            debugLog('pullAll: Failed to get doc via HTTP', entry.path);
-                            return;
+                            throw new Error(`Failed to download ${entry.path}: ${result.message || 'no document content'}`);
                         }
                         const content = result.lines.join('\n');
                         remoteContent = new TextEncoder().encode(content);
@@ -1839,8 +1858,7 @@ export class SyncEngine {
                     // For binary files, use HTTP API
                     const result = await this.api.getFile(projectSettings.projectId, entry.id);
                     if (result.type !== 'success' || !result.content) {
-                        debugLog('pullAll: Failed to get file', entry.path);
-                        return;
+                        throw new Error(`Failed to download ${entry.path}: ${result.message || 'no file content'}`);
                     }
                     remoteContent = result.content;
                     debugLog('pullAll: Got file via HTTP', entry.path, 'size:', result.content.length);
@@ -2016,6 +2034,7 @@ export class SyncEngine {
      * Disconnect and cleanup
      */
     disconnect(): void {
+        this.disposed = true;
         this.socket?.disconnect();
         this.socket = undefined;
         this.disposables.forEach(d => d.dispose());

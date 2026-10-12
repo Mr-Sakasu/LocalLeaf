@@ -123,8 +123,8 @@ async function run(): Promise<void> {
     );
     assert.equal(
         propagation.shouldPropagate('push', '/chapter.tex', Uint8Array.from([2])),
-        false,
-        'identical content should still be treated as an echo'
+        true,
+        'unacknowledged content must remain eligible for retry'
     );
 
     const textCreation = Object.create(SyncEngine.prototype) as any;
@@ -288,6 +288,7 @@ async function run(): Promise<void> {
     assert.equal(retryScheduled, true);
 
     const localCreate = Object.create(SyncEngine.prototype) as any;
+    localCreate.socket = { isConnected: true };
     localCreate.getRelativePath = () => '/new.tex';
     localCreate.shouldSync = () => true;
     localCreate.acquireLock = () => false;

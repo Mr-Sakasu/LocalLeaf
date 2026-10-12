@@ -6,6 +6,13 @@
 import * as http from 'http';
 import * as https from 'https';
 import * as stream from 'stream';
+import fetchImpl, { RequestInfo, RequestInit } from 'node-fetch';
+
+// Bound both response and body waits so a dropped connection cannot hold the
+// extension's serialized command queue indefinitely (node-fetch v2).
+function fetch(url: RequestInfo, options: RequestInit = {}) {
+    return fetchImpl(url, { ...options, timeout: 30000 });
+}
 import { Identity } from '../utils/credentialManager';
 
 export interface ProjectInfo {
@@ -73,7 +80,6 @@ export class BaseAPI {
      * Get CSRF token from login page
      */
     private async getCsrfToken(): Promise<Identity> {
-        const fetch = (await import('node-fetch')).default;
         const res = await fetch(this.url + 'login', {
             method: 'GET',
             redirect: 'manual',
@@ -94,7 +100,6 @@ export class BaseAPI {
      * Get user ID from project page (validates cookies)
      */
     private async getUserId(cookies: string): Promise<{ userId: string; userEmail: string; csrfToken: string } | undefined> {
-        const fetch = (await import('node-fetch')).default;
         const res = await fetch(this.url + 'project', {
             method: 'GET',
             redirect: 'manual',
@@ -124,7 +129,6 @@ export class BaseAPI {
      * Update cookies with socket.io session
      */
     async updateCookies(identity: Identity): Promise<Identity> {
-        const fetch = (await import('node-fetch')).default;
         const res = await fetch(this.url + 'socket.io/socket.io.js', {
             method: 'GET',
             redirect: 'manual',
@@ -168,7 +172,6 @@ export class BaseAPI {
      * Login with email and password (not available for www.overleaf.com due to SSO/captcha)
      */
     async passportLogin(email: string, password: string): Promise<ResponseSchema> {
-        const fetch = (await import('node-fetch')).default;
         const identity = await this.getCsrfToken();
         const res = await fetch(this.url + 'login', {
             method: 'POST',
@@ -251,7 +254,6 @@ export class BaseAPI {
             return { type: 'error', message: 'Not authenticated' };
         }
 
-        const fetch = (await import('node-fetch')).default;
         const headers: Record<string, string> = {
             'Connection': 'keep-alive',
             'Cookie': this.identity.cookies,
@@ -293,7 +295,6 @@ export class BaseAPI {
             throw new Error('Not authenticated');
         }
 
-        const fetch = (await import('node-fetch')).default;
         const content: Buffer[] = [];
 
         while (true) {
@@ -335,7 +336,6 @@ export class BaseAPI {
             return { type: 'error', message: 'Not authenticated' };
         }
 
-        const fetch = (await import('node-fetch')).default;
         const res = await fetch(this.url + 'user/projects', {
             method: 'GET',
             redirect: 'manual',
@@ -386,7 +386,6 @@ export class BaseAPI {
         }
 
         const FormData = require('form-data');
-        const fetch = (await import('node-fetch')).default;
         const mimeTypes = require('mime-types');
 
         const fileStream = stream.Readable.from(fileContent);
@@ -450,7 +449,6 @@ export class BaseAPI {
             return { type: 'error', message: 'Not authenticated' };
         }
 
-        const fetch = (await import('node-fetch')).default;
         const res = await fetch(this.url + `project/${projectId}/doc`, {
             method: 'POST',
             redirect: 'manual',
@@ -502,7 +500,6 @@ export class BaseAPI {
             return { type: 'error', message: 'Not authenticated' };
         }
 
-        const fetch = (await import('node-fetch')).default;
         const res = await fetch(this.url + `project/${projectId}/folder`, {
             method: 'POST',
             redirect: 'manual',
@@ -556,7 +553,6 @@ export class BaseAPI {
             return { type: 'error', message: 'Not authenticated' };
         }
 
-        const fetch = (await import('node-fetch')).default;
         const res = await fetch(this.url + `project/${projectId}/${entityType}/${entityId}/rename`, {
             method: 'POST',
             redirect: 'manual',
@@ -595,7 +591,6 @@ export class BaseAPI {
             return { type: 'error', message: 'Not authenticated' };
         }
 
-        const fetch = (await import('node-fetch')).default;
         const res = await fetch(this.url + `project/${projectId}/${entityType}/${entityId}/move`, {
             method: 'POST',
             redirect: 'manual',
@@ -637,7 +632,6 @@ export class BaseAPI {
             return { type: 'error', message: 'Not authenticated' };
         }
 
-        const fetch = (await import('node-fetch')).default;
 
         // Get project page which contains metadata in HTML
         const res = await fetch(this.url + `project/${projectId}`, {
@@ -698,7 +692,6 @@ export class BaseAPI {
             return { type: 'error', message: 'Not authenticated' };
         }
 
-        const fetch = (await import('node-fetch')).default;
         const res = await fetch(this.url + `project/${projectId}/entities`, {
             method: 'GET',
             redirect: 'manual',
@@ -728,7 +721,6 @@ export class BaseAPI {
             return { type: 'error', message: 'Not authenticated' };
         }
 
-        const fetch = (await import('node-fetch')).default;
         const res = await fetch(this.url + `project/${projectId}/doc/${docId}`, {
             method: 'GET',
             redirect: 'manual',

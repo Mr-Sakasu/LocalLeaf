@@ -3,7 +3,6 @@
  * Adapted from Overleaf-Workshop
  */
 
-import { promisify } from 'util';
 import * as vscode from 'vscode';
 import { BaseAPI, ProjectEntity, FileEntity } from './base';
 import { Identity } from '../utils/credentialManager';
@@ -107,6 +106,7 @@ export class SocketIOAPI {
     private _handshakeComplete: boolean = false;
     private _handshakePromise!: Promise<void>;
     private _handshakeResolve!: () => void;
+    private pendingEmits = new Set<(error: Error) => void>();
 
     constructor(
         private readonly api: BaseAPI,
@@ -141,24 +141,52 @@ export class SocketIOAPI {
      * Reference: Overleaf-Workshop socketio.ts
      */
     private setupEmit() {
-        (this.socket.emit)[promisify.custom] = (event: string, ...args: any[]) => {
-            const timeoutPromise = new Promise<any[]>((_, reject) => {
-                setTimeout(() => {
-                    reject(new Error('Socket emit timeout'));
+        this.emit = (event: string, ...args: any[]) => {
+            if (!this._connected) return Promise.reject(new Error('Socket disconnected'));
+            return new Promise<any[]>((resolve, reject) => {
+                const fail = (error: Error) => {
+                    clearTimeout(timer);
+                    this.pendingEmits.delete(fail);
+                    reject(error);
+                };
+                const timer = setTimeout(() => {
+                    fail(new Error(`Socket emit timeout: ${event}`));
+                    // The acknowledgement may have been lost. Rejoin with a fresh
+                    // document version before allowing any further OT updates.
+                    log(`Socket emit timeout: ${event}`);
+                    if (['joinDoc', 'leaveDoc', 'applyOtUpdate'].includes(event)) this.disconnect();
                 }, 5000);
+                this.pendingEmits.add(fail);
+                try {
+                    this.socket.emit(event, ...args, (err: any, ...data: any[]) => {
+                        if (!this.pendingEmits.has(fail)) return;
+                        clearTimeout(timer);
+                        this.pendingEmits.delete(fail);
+                        if (err) reject(new Error(String(err)));
+                        else resolve(data);
+                    });
+                } catch (error) {
+                    fail(error instanceof Error ? error : new Error(String(error)));
+                }
             });
-            const waitPromise = new Promise<any[]>((resolve, reject) => {
-                this.socket.emit(event, ...args, (err: any, ...data: any[]) => {
-                    if (err) {
-                        reject(new Error(err));
-                    } else {
-                        resolve(data);
-                    }
-                });
-            });
-            return Promise.race([waitPromise, timeoutPromise]);
         };
-        this.emit = promisify(this.socket.emit).bind(this.socket);
+    }
+
+    private markDisconnected(authError = false): void {
+        this._connected = false;
+        for (const fail of [...this.pendingEmits]) fail(new Error('Socket disconnected'));
+        this.handlers.forEach(h => h.onDisconnected?.(authError));
+    }
+
+    private async withTimeout<T>(promise: Promise<T>, message: string, delay = 5000): Promise<T> {
+        let timer: NodeJS.Timeout | undefined;
+        try {
+            return await Promise.race([promise, new Promise<never>((_, reject) => {
+                timer = setTimeout(() => reject(new Error(message)), delay);
+            })]);
+        } finally {
+            if (timer) clearTimeout(timer);
+        }
     }
 
     /**
@@ -174,7 +202,7 @@ export class SocketIOAPI {
 
         this.socket.on('connect_failed', () => {
             log('Connection failed');
-            this._connected = false;
+            this.markDisconnected();
         });
 
         this.socket.on('forceDisconnect', (message: string, delay: number = 10) => {
@@ -182,7 +210,7 @@ export class SocketIOAPI {
             this._connected = false;
             // Check if force disconnect is auth-related
             const isAuthError = this.isAuthRelatedMessage(message);
-            this.handlers.forEach(h => h.onDisconnected?.(isAuthError));
+            this.markDisconnected(isAuthError);
         });
 
         this.socket.on('error', (err: any) => {
@@ -191,8 +219,7 @@ export class SocketIOAPI {
 
         this.socket.on('disconnect', () => {
             log('Disconnected from Overleaf');
-            this._connected = false;
-            this.handlers.forEach(h => h.onDisconnected?.(false));
+            this.markDisconnected();
         });
 
         this.socket.on('connectionRejected', (err: any) => {
@@ -200,7 +227,7 @@ export class SocketIOAPI {
             this._connected = false;
             // Check if rejection is auth-related
             const isAuthError = this.isAuthRelatedMessage(err?.message);
-            this.handlers.forEach(h => h.onDisconnected?.(isAuthError));
+            this.markDisconnected(isAuthError);
         });
 
         this.socket.on('connectionAccepted', (_: any, publicId: string) => {
@@ -301,13 +328,7 @@ export class SocketIOAPI {
             return;
         }
 
-        const timeoutPromise = new Promise<void>((_, reject) => {
-            setTimeout(() => {
-                reject(new Error('Socket handshake timeout'));
-            }, timeoutMs);
-        });
-
-        await Promise.race([this._handshakePromise, timeoutPromise]);
+        await this.withTimeout(this._handshakePromise, 'Socket handshake timeout', timeoutMs);
     }
 
     /**
@@ -318,15 +339,9 @@ export class SocketIOAPI {
         // Wait for handshake before emitting
         await this.waitForHandshake();
 
-        const timeoutPromise = new Promise<never>((_, reject) => {
-            setTimeout(() => {
-                reject(new Error('Join project timeout'));
-            }, 5000);
-        });
-
         // v2 uses joinProjectResponse event instead of callback
         if (this.projectRecordPromise) {
-            const project = await Promise.race([this.projectRecordPromise, timeoutPromise]);
+            const project = await this.withTimeout(this.projectRecordPromise, 'Join project timeout');
             log(`Connected to project (real-time)`);
             return project;
         }
@@ -417,18 +432,9 @@ export class SocketIOAPI {
      * Disconnect from socket
      */
     disconnect() {
+        this.markDisconnected();
+        this.socket.removeAllListeners();
         this.socket.disconnect();
-        this._connected = false;
-    }
-
-    /**
-     * Reconnect to socket
-     */
-    reconnect() {
-        if (!this._connected) {
-            log('Reconnecting...');
-            this.init();
-        }
     }
 
     /**
